@@ -76,3 +76,8 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = "static/"
 
+
+# Twilio Configuration (load from .env in production)
+TWILIO_ACCOUNT_SID = 
+TWILIO_AUTH_TOKEN = 
+TWILIO_VERIFY_SERVICE_SID = 
