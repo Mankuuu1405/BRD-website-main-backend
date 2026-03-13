@@ -20,6 +20,7 @@ INSTALLED_APPS = [
 
     "rest_framework",
     "corsheaders",
+    "access",
     "signup",
 ]
 
@@ -76,8 +77,7 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = "static/"
 
-
-# Twilio Configuration (load from .env in production)
-TWILIO_ACCOUNT_SID = 
-TWILIO_AUTH_TOKEN = 
-TWILIO_VERIFY_SERVICE_SID = 
+# Twilio configuration
+TWILIO_ACCOUNT_SID = "dummy_sid"
+TWILIO_AUTH_TOKEN = "dummy"
+TWILIO_PHONE_NUMBER = "dummy"

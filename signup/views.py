@@ -10,8 +10,7 @@ import string
 
 # Initialize Twilio client
 client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-VERIFY_SID = settings.TWILIO_VERIFY_SERVICE_SID
-
+VERIFY_SID = getattr(settings, 'TWILIO_VERIFY_SERVICE_SID', 'dummy')
 # ---------------------------
 # Send OTP to Mobile
 # ---------------------------
