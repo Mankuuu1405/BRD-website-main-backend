@@ -1,11 +1,12 @@
 from pathlib import Path
 import os
 from dotenv import load_dotenv
-
-load_dotenv()
+import os
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+load_dotenv(BASE_DIR / ".env") 
 SECRET_KEY = "dev-secret-key"
 DEBUG = True
 ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
@@ -68,7 +69,11 @@ DATABASES = {
         "NAME": BASE_DIR / "db.sqlite3",
     }
 }
-
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    }
+}
 AUTH_USER_MODEL = "signup.User"
 
 LANGUAGE_CODE = "en-us"
@@ -77,7 +82,6 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = "static/"
 
-# Twilio configuration
-TWILIO_ACCOUNT_SID = "dummy_sid"
-TWILIO_AUTH_TOKEN = "dummy"
-TWILIO_PHONE_NUMBER = "dummy"
+TWILIO_ACCOUNT_SID   = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")

@@ -1,39 +1,74 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from rest_framework import status
-from twilio.rest import Client
 from django.conf import settings
-from .models import User, Business, PendingRegistration
+from django.core.cache import cache
 from django.db import transaction
-import random
-import string
+from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import check_password
+from .models import Business, PendingRegistration
 
-# Initialize Twilio client
-client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-VERIFY_SID = getattr(settings, 'TWILIO_VERIFY_SERVICE_SID', 'dummy')
+import requests
+import random
+
+User = get_user_model()
+
 # ---------------------------
-# Send OTP to Mobile
+# Helper: Send SMS via Twilio
+# ---------------------------
+def send_sms(phone_number, otp):
+    try:
+        account_sid = settings.TWILIO_ACCOUNT_SID
+        auth_token  = settings.TWILIO_AUTH_TOKEN
+        from_whatsapp = f"whatsapp:{settings.TWILIO_WHATSAPP_FROM}"
+
+        formatted = phone_number if phone_number.startswith('+') else f"+91{phone_number}"
+        to_whatsapp = f"whatsapp:{formatted}"
+
+        response = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
+            auth=(account_sid, auth_token),
+            data={
+                "From": from_whatsapp,
+                "To": to_whatsapp,
+                "Body": f"Your OTP is {otp}. Valid for 5 minutes."
+            }
+        )
+
+        print("Twilio:", response.status_code, response.text)
+        return response.status_code == 201
+
+    except Exception as e:
+        print("SMS ERROR:", str(e))
+        return False
+
+
+# ---------------------------
+# Generate OTP
+# ---------------------------
+def generate_otp(mobile_no):
+    otp = str(random.randint(100000, 999999))
+    cache.set(f"otp_{mobile_no}", otp, timeout=300)
+    return otp
+
+
+# ---------------------------
+# SEND OTP
 # ---------------------------
 @api_view(["POST"])
 def send_otp(request):
-    """
-    Stores registration data temporarily and sends OTP via Twilio
-    """
     mobile_no = request.data.get("mobile_no")
-    email = request.data.get("email")
+    email     = request.data.get("email")
 
-    if not mobile_no:
-        return Response({"error": "Mobile number is required"}, status=400)
+    if not mobile_no or not email:
+        return Response({"error": "Mobile & email required"}, status=400)
 
-    # Check if user already exists
     if User.objects.filter(mobile_no=mobile_no).exists():
-        return Response({"error": "Mobile number already registered"}, status=400)
-    
+        return Response({"error": "Mobile already registered"}, status=400)
+
     if User.objects.filter(email=email).exists():
         return Response({"error": "Email already registered"}, status=400)
 
     try:
-        # Store the entire registration data temporarily
         PendingRegistration.objects.update_or_create(
             mobile_no=mobile_no,
             defaults={
@@ -42,161 +77,207 @@ def send_otp(request):
             }
         )
 
-        # Format mobile number for Twilio (assuming Indian number)
-        # Adjust country code based on your requirements
-        formatted_mobile = mobile_no
-        if not formatted_mobile.startswith('+'):
-            # Add country code if not present (e.g., +91 for India)
-            formatted_mobile = f"+91{mobile_no}"
+        otp = generate_otp(mobile_no)
 
-        # Send OTP via Twilio Verify
-        verification = client.verify.v2.services(VERIFY_SID).verifications.create(
-            to=formatted_mobile,
-            channel="sms"
-        )
+        if send_sms(mobile_no, otp):
+            return Response({
+                "status": "pending",
+                "message": "OTP sent"
+            })
 
-        return Response({
-            "status": verification.status,
-            "message": f"OTP sent to {mobile_no}",
-            "mobile_no": mobile_no
-        })
+        return Response({"error": "OTP sending failed"}, status=500)
 
     except Exception as e:
         return Response({"error": str(e)}, status=500)
 
+
 # ---------------------------
-# Verify OTP and Complete Registration
+# VERIFY OTP + CREATE USER
 # ---------------------------
 @api_view(["POST"])
 def verify_otp(request):
-    """
-    Verifies OTP and completes user registration
-    """
     mobile_no = request.data.get("mobile_no")
-    code = request.data.get("otp")
+    otp       = request.data.get("otp")
 
-    if not mobile_no or not code:
-        return Response({"error": "Mobile number and OTP are required"}, status=400)
+    if not mobile_no or not otp:
+        return Response({"error": "Mobile & OTP required"}, status=400)
 
     try:
-        # Get pending registration data
-        pending_reg = PendingRegistration.objects.filter(mobile_no=mobile_no).first()
-        
-        if not pending_reg:
-            return Response({"error": "No pending registration found for this mobile number"}, status=404)
-        
-        if pending_reg.is_expired():
-            pending_reg.delete()
-            return Response({"error": "Registration session expired. Please start again."}, status=400)
+        pending = PendingRegistration.objects.filter(mobile_no=mobile_no).first()
 
-        # Format mobile number for Twilio verification
-        formatted_mobile = mobile_no
-        if not formatted_mobile.startswith('+'):
-            formatted_mobile = f"+91{mobile_no}"
+        if not pending:
+            return Response({"error": "No pending registration"}, status=404)
 
-        # Verify OTP with Twilio
-        verification_check = client.verify.v2.services(VERIFY_SID).verification_checks.create(
-            to=formatted_mobile,
-            code=code
-        )
+        saved_otp = cache.get(f"otp_{mobile_no}")
 
-        if verification_check.status == "approved":
-            # OTP verified successfully - create user and business
-            registration_data = pending_reg.registration_data
-            
-            with transaction.atomic():
-                # Generate temporary password
-                temp_password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-                
-                # Create User
-                user = User.objects.create_user(
-                    email=registration_data['email'],
-                    mobile_no=registration_data['mobile_no'],
-                    password=temp_password,
-                    contact_person=registration_data['contact_person'],
-                    is_mobile_verified=True
-                )
-                
-                # Create Business
-                Business.objects.create(
-                    user=user,
-                    business_name=registration_data['business_name'],
-                    business_type=registration_data['business_type'],
-                    business_pan=registration_data.get('business_pan', ''),
-                    owner_pan=registration_data.get('owner_pan', ''),
-                    gst_number=registration_data.get('gst_number', ''),
-                    duns_number=registration_data.get('duns_number', ''),
-                    cin=registration_data.get('cin', ''),
-                    business_website=registration_data.get('business_website', ''),
-                    business_description=registration_data['business_description'],
-                    subscription_type=registration_data['subscription_type'],
-                    loan_product=registration_data.get('loan_product', []),
-                    address_line1=registration_data['address_line1'],
-                    address_line2=registration_data.get('address_line2', ''),
-                    city=registration_data['city'],
-                    state=registration_data['state'],
-                    pincode=registration_data['pincode'],
-                    country=registration_data['country'],
-                    status=registration_data.get('status', 'Active')
-                )
-                
-                # Delete pending registration
-                pending_reg.delete()
-                
-                # TODO: Send email with temporary password
-                # You can integrate email service here
-                print(f"Temporary password for {user.email}: {temp_password}")
-                
-                return Response({
-                    "verified": True,
-                    "message": "Registration successful! Temporary password sent to your email.",
-                    "email": user.email
-                })
-        else:
-            return Response({
-                "verified": False,
-                "error": "Invalid or expired OTP"
-            }, status=400)
+        if not saved_otp:
+            return Response({"error": "OTP expired"}, status=400)
 
-    except PendingRegistration.DoesNotExist:
-        return Response({"error": "No pending registration found"}, status=404)
+        if saved_otp != otp:
+            return Response({"error": "Invalid OTP"}, status=400)
+
+        data = pending.registration_data
+
+        with transaction.atomic():
+            user = User.objects.create_user(
+                email=data.get("email"),
+                mobile_no=data.get("mobile_no"),
+                password=data.get("password"),   # ✅ FIXED
+                contact_person=data.get("contact_person"),
+                is_mobile_verified=True
+            )
+
+            Business.objects.create(
+                user=user,
+                business_name=data.get("business_name"),
+                business_type=data.get("business_type"),
+                business_pan=data.get("business_pan", ""),
+                owner_pan=data.get("owner_pan", ""),
+                gst_number=data.get("gst_number", ""),
+                loan_product=data.get("loan_product", []),
+                address_line1=data.get("address_line1"),
+                address_line2=data.get("address_line2", ""),
+                city=data.get("city"),
+                state=data.get("state"),
+                pincode=data.get("pincode"),
+                country=data.get("country"),
+                status=data.get("status", "Active"),
+            )
+
+        cache.delete(f"otp_{mobile_no}")
+        pending.delete()
+
+        return Response({
+            "message": "Registration successful"
+        })
+
     except Exception as e:
         return Response({"error": str(e)}, status=500)
 
+
 # ---------------------------
-# Resend OTP
+# DIRECT REGISTER (NO OTP)
+# ---------------------------
+@api_view(["POST"])
+def register_user(request):
+    try:
+        data = request.data
+        print("REGISTER DATA:", data)
+
+        import json
+
+        email = data.get("email")
+        mobile_no = data.get("mobile_no")
+
+        # ✅ Validate required fields
+        if not email:
+            return Response({"error": "Email is required"}, status=400)
+
+        if not mobile_no:
+            return Response({"error": "Mobile number is required"}, status=400)
+
+        if not data.get("password"):
+            return Response({"error": "Password is required"}, status=400)
+
+        # ✅ Duplicate checks
+        if User.objects.filter(email=email).exists():
+            return Response({"error": "Email already registered"}, status=400)
+
+        if User.objects.filter(mobile_no=mobile_no).exists():
+            return Response({"error": "Mobile number already registered"}, status=400)
+
+        # ✅ Fix mapping
+        business_type = data.get("business_type") or data.get("organisation_type") or "General"
+
+        with transaction.atomic():
+            user = User.objects.create_user(
+                email=email,
+                mobile_no=mobile_no,
+                password=data.get("password"),
+                contact_person=data.get("contact_person") or "User",
+                is_mobile_verified=True
+            )
+
+            Business.objects.create(
+                user=user,
+                business_name=data.get("business_name") or "Default Business",
+                business_type=business_type,
+
+                business_pan=data.get("business_pan", ""),
+                owner_pan=data.get("owner_pan", ""),
+                gst_number=data.get("gst_number", ""),
+
+                business_description=data.get("business_description", "N/A"),
+                subscription_type=data.get("subscription_type", "Free"),
+
+                loan_product=json.dumps(data.get("loan_product", [])),
+
+                address_line1=data.get("address_line1") or "N/A",
+                address_line2=data.get("address_line2", ""),
+                city=data.get("city") or "N/A",
+                state=data.get("state") or "N/A",
+                pincode=data.get("pincode") or "000000",
+                country=data.get("country") or "India",
+
+                status=data.get("status", "Active"),
+            )
+
+        return Response({"message": "Registration successful"}, status=201)
+
+    except Exception as e:
+        import traceback
+        print("🔥 REGISTER ERROR:", str(e))
+        traceback.print_exc()
+        return Response({"error": str(e)}, status=400)
+# ---------------------------
+# LOGIN
+# ---------------------------
+@api_view(["POST"])
+def login_user(request):
+    try:
+        email = request.data.get("email")
+        password = request.data.get("password")
+
+        if not email or not password:
+            return Response({"error": "Email & password required"}, status=400)
+
+        user = User.objects.filter(email=email).first()
+
+        if not user:
+            return Response({"error": "User not found"}, status=404)
+
+        if not check_password(password, user.password):
+            return Response({"error": "Invalid credentials"}, status=401)
+
+        return Response({
+            "message": "Login successful",
+            "user_id": user.id,
+            "email": user.email
+        })
+
+    except Exception as e:
+        print("LOGIN ERROR:", str(e))
+        return Response({"error": str(e)}, status=500)
+
+
+# ---------------------------
+# RESEND OTP
 # ---------------------------
 @api_view(["POST"])
 def resend_otp(request):
-    """
-    Resends OTP to the mobile number
-    """
     mobile_no = request.data.get("mobile_no")
-    
-    if not mobile_no:
-        return Response({"error": "Mobile number is required"}, status=400)
-    
-    # Check if pending registration exists
-    pending_reg = PendingRegistration.objects.filter(mobile_no=mobile_no).first()
-    
-    if not pending_reg:
-        return Response({"error": "No pending registration found"}, status=404)
-    
-    try:
-        formatted_mobile = mobile_no
-        if not formatted_mobile.startswith('+'):
-            formatted_mobile = f"+91{mobile_no}"
-        
-        verification = client.verify.v2.services(VERIFY_SID).verifications.create(
-            to=formatted_mobile,
-            channel="sms"
-        )
-        
-        return Response({
-            "status": verification.status,
-            "message": f"OTP resent to {mobile_no}"
-        })
-    
-    except Exception as e:
-        return Response({"error": str(e)}, status=500)
 
+    if not mobile_no:
+        return Response({"error": "Mobile required"}, status=400)
+
+    pending = PendingRegistration.objects.filter(mobile_no=mobile_no).first()
+
+    if not pending:
+        return Response({"error": "No pending registration"}, status=404)
+
+    otp = generate_otp(mobile_no)
+
+    if send_sms(mobile_no, otp):
+        return Response({"message": "OTP resent"})
+
+    return Response({"error": "Failed to resend OTP"}, status=500)
